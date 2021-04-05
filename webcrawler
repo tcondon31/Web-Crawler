@@ -1,10 +1,212 @@
 #!/usr/bin/env python3
 import socket
+import sys
+from html.parser import HTMLParser
+from queue import Queue
+
+RECV_SZ = 8192
+GET = 'GET'
+POST = 'POST'
+CRLF = '\r\n'
+CRLF_B = CRLF.encode()
+
+class HTTPClient:
+    sock = None
+    connected: bool
+    host: str
+    port: int
+
+    def __init__(self, port=80):
+        self.connected = False
+        self.host = 'webcrawler-site.ccs.neu.edu'
+        self.port = port
+
+    def open_socket(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.connect((self.host, self.port))
+
+    def send_request(self, msg_type, host, page, headers=None, cookies=None, data=None):
+        request = f'{msg_type} {page} HTTP/1.1{CRLF}Host: {host}{CRLF}'
+        if headers:
+            for header, value in headers:
+                request += f'{header}: {value}{CRLF}'
+        if cookies:
+            cookies_list = []
+            for cookie in cookies.items():
+                cookies_list.append('='.join(cookie))
+            request += 'Cookie: ' + '; '.join(cookies_list) + CRLF
+        if data:
+            request += 'Content-Type: application/x-www-form-urlencoded' + CRLF
+            request += 'Content-Length: ' + str(len(data)) + CRLF + CRLF
+            request += data + CRLF
+        request += CRLF
+
+        if not self.connected:
+            self.open_socket()
+            self.connected = True
+        self.sock.sendall(request.encode())
+
+        response = b''
+        recv = self.sock.recv(RECV_SZ)
+
+        while True:
+            response += recv
+            if self.is_end_of_response(response):
+                end = False
+                break
+            recv = self.sock.recv(RECV_SZ)
+        
+        parsed_http = HTTPResponse(response)
+        if (parsed_http.headers['Connection'] == 'close'):
+            self.connected = False
+
+        return parsed_http
+    
+    def send_get(self, host, page, headers=None, cookies=None):
+        return self.send_request(GET, host, page, headers, cookies)
+    
+    def send_post(self, host, page, headers=None, cookies=None, data=None):
+        return self.send_request(POST, host, page, headers, cookies, data)
+
+    def is_end_of_response(self, response):
+        global end
+        end = False
+        if response.decode().endswith(CRLF + CRLF):
+            return True
+        else:
+            response_parser = ResponseParser()
+            response_parser.feed(response.decode())
+            return end
+
+class HTTPResponse:
+    status: int
+    status_msg: str
+    headers: dict
+    cookies: dict
+    data: str
+
+    def __init__(self, response):
+        self.headers = {}
+        self.cookies = {}
+
+        headers_and_data = response.split(CRLF_B + CRLF_B)
+        all_headers = headers_and_data[0].decode().split(CRLF)
+
+        full_status = all_headers[0].split(' ')
+        self.status = int(full_status[1])
+        self.status_msg = full_status[2]
+
+        for header in all_headers[1:]:
+            self.parse_header(header)
+        
+        if "Transfer-Encoding" in self.headers and self.headers["Transfer-Encoding"] == "chunked":
+            self.data = self.unchunk(headers_and_data[1:][0])
+        else:
+            self.data = headers_and_data[1]
+
+        if "Content-Encoding" in self.headers:
+            self.data = gzip.decompress(self.data)
+        
+    def parse_header(self, header):
+        h = header.split(': ')
+        if h[0] == 'Set-Cookie':
+            cook = h[1].split('; ')
+            type_and_value = cook[0].split('=')
+            self.cookies[type_and_value[0]] = type_and_value[1]
+        self.headers[h[0]] = h[1]
+
+    def unchunk(self, raw):
+        lines = raw.split(CLRF_BIN)
+        return b''.join(lines[1::2])
+
+class ResponseParser(HTMLParser):
+    def handle_endtag(self, tag):
+        if tag == 'html':
+            global end
+            end = True
+
+class FlagParser(HTMLParser):
+    def handle_data(self, data):
+        if data.startswith('FLAG: '):
+            global flags_found
+            flags_found+=1
+            print(data[6:])
+
+class FindPagesParser(HTMLParser):
+    def __init__(self, current_host):
+        HTMLParser.__init__(self)
+        global pages
+        pages = []
+        self.current_host = current_host
+
+    def handle_starttag(self, tag, attrs):
+        global pages
+        if tag == 'a':
+            for attr in attrs:
+                if attr[0] == 'href':
+                    if (attr[1].startswith('/') or attr[1].startswith(self.current_host)) and attr[1] != '/accounts/logout/':
+                        pages.append(attr[1])
+
+class Crawler:
+    http_client: HTTPClient
+    page_q: Queue
+    visited: set
+    current_host: str
+    current_page: str
+    cookies: dict
+    flag_parser: FlagParser
+
+    def __init__(self):
+        self.http_client = HTTPClient()
+        self.page_q = Queue()
+        self.visited = set()
+        self.cookies = {}
+        self.flag_parser = FlagParser()
+        global flags_found
+        flags_found = 0
+
+    def login(self, username, password):
+        self.current_host = 'webcrawler-site.ccs.neu.edu'
+        self.current_page = '/accounts/login/'
+        response = self.http_client.send_get(self.current_host, self.current_page)
+        if response.status == 200:
+            csrf_token = response.cookies['csrftoken']
+            data = f'username={username}&password={password}&csrfmiddlewaretoken={csrf_token}&next=/fakebook/{CRLF}'
+            response = self.http_client.send_post(self.current_host, self.current_page, cookies=response.cookies, data=data)
+            if response.status == 302:
+                self.page_q.put('/fakebook/')
+                self.cookies = response.cookies
+            else:
+                raise Exception('Could not login to Fakebook')
+        else:
+            raise Exception('Could not connect to Fakebook')
+
+    def crawl(self):
+        global flags_found
+        while (not self.page_q.empty()) and (flags_found < 5):
+            page = self.page_q.get()
+            if page not in self.visited and self.current_host == 'webcrawler-site.ccs.neu.edu':
+                self.current_page = page
+                self.visit_page()
+                self.visited.add(page)
+
+    def visit_page(self):
+        response = self.http_client.send_get(self.current_host, self.current_page, cookies=self.cookies)
+        if response.status == 200:
+            find_pages_parser = FindPagesParser(self.current_host)
+            self.flag_parser.feed(response.data.decode())
+            find_pages_parser.feed(response.data.decode())
+            for p in pages:
+                self.page_q.put(p)
+        elif response.status == 302:
+            self.page_q.put(response.headers['Location']) 
 
 if __name__ == "__main__":
-    # Establish socket connection
-    addr = ('webcrawler-site.ccs.neu.edu', 80)
-    http_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    http_sock.connect(addr)
-
-    
+    if len(sys.argv) == 3:
+        username = sys.argv[1]
+        password = sys.argv[2]
+        crawler = Crawler()
+        crawler.login(username, password)
+        crawler.crawl()
+    else:
+        raise Exception("Invalid number of arguments entered.")
